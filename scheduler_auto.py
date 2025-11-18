@@ -1,0 +1,1074 @@
+import datetime
+import json
+import os
+import re
+import threading
+import time
+import uuid
+from typing import Dict, List
+from urllib.parse import quote
+
+import requests
+import concurrent.futures
+from bricks.db.redis_ import Redis
+from loguru import logger
+from urllib3.exceptions import RequestError
+
+from db.mongo import MongoClientSingleton
+from parse_detail import parse_room
+from utils.date_switch import parse_checkin_checkout
+from utils.task_platform_login import rsa_encrypt_base64
+
+# Redis 连接配置
+REDIS_HOST = "192.168.1.191"
+REDIS_PORT = 6379
+REDIS_DB = 0
+REDIS_KEY = "ctrip_ck"
+MAX_RETRIES = 5
+
+class SchedulerAuto:
+    """
+    单用户任务是串行的，也就是说单个用户只有执行完第一个任务才能接收下一个
+    """
+
+    def __init__(self, username: str, password: str):
+        self.username = username
+        self.password = password
+        self.token = None
+        self.cookie_col = "cookie_use_log"
+
+        # ✅ 初始化 MongoDB
+        self.redis = Redis(host=REDIS_HOST)
+        self.mongo = MongoClientSingleton(db_name="ctrip")
+
+        # 添加线程锁确保单个账号串行执行
+        self.lock = threading.Lock()
+
+
+
+    def login(self):
+        # 登录接口地址（换成你实际的平台登录接口）
+        api = "http://47.101.140.209/crowd/task/login"
+
+        body = rsa_encrypt_base64(f"{self.username}_{self.password}")
+
+        # 可选请求头（根据平台要求修改）
+        headers = {
+            "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0"
+        }
+
+        # 发送请求
+        response = requests.post(api, body, headers=headers)
+
+        # 解析响应
+        try:
+            if response.status_code == 200:
+                res_json = response.json()
+                if res_json.get("success") and res_json.get("code") == 200:
+                    self.token = res_json.get("data")
+                    logger.info(f"》》》》》step1. {self.username}用户登录成功\n\n")
+
+                else:
+                    logger.warning("❌ 登录失败:", res_json.get("msg"))
+            else:
+                logger.error("❌ 请求失败，状态码:", response.status_code)
+        except Exception as e:
+            logger.error(f"❌ 登录异常: {e}")
+
+    def get_tasks(self):
+        api = "http://47.101.140.209/crowd/task/listTask"
+        if self.token:
+            params = {
+                "token": self.token,
+            }
+            try:
+                response = requests.get(api, params)
+                raw_task = response.json()
+                tasks = self.task_filter(raw_task)
+                return tasks
+            except Exception as e:
+                logger.warning(f"获取任务列表请求出错, 错误原因{e}")
+                return []
+        else:
+            logger.warning("登录失败，请检查登录状态")
+        return []
+
+    @staticmethod
+    def extract_dates(text: str):
+        """
+        从字符串中提取入店时间和离店时间
+        例如输入："入店时间：2025-11-09  离店时间：2025-11-10"
+        返回 ("2025-11-09", "2025-11-10")
+        """
+        pattern = r".*?店时间：(\d{4}-\d{2}-\d{2})\s*离店时间：(\d{4}-\d{2}-\d{2})"
+        match = re.search(pattern, text)
+        if match:
+            check_in, check_out = match.groups()
+            return check_in, check_out
+        return None, None
+
+    def get_running_task(self):
+        """
+        获取当前账号是否存在进行中任务
+        :return:
+        """
+        result = []
+        api = "http://47.101.140.209/crowd/task/queryClaimRecordList"
+
+        params = {
+            "type": "today",
+            "claimStatus": "CLAIMED",
+            "pageSize": "10",
+            "pageNo": "1",
+            "token": self.token
+        }
+
+        try:
+            response = requests.get(api, params)
+            if all([
+                response.status_code == 200,
+                response.json()["code"] == 200,
+                response.json()["msg"] == "正常返回"
+            ]):
+                data = response.json()["data"]
+                if data:
+                    task_list = data.get("claimRecordVOList")
+                    if task_list:
+                        item = task_list[0]
+                        result.append({
+                            "task_id": item["taskSetId"],
+                            "task_name": item["shidName"],
+                            "task_type": item["taskType"],
+                            "valid_task_num": 1,
+                            "running_task": 1
+                        })
+
+        except Exception as e:
+            logger.error(f"获取正在运行中结果报错， 错误原因{e}")
+        return result
+
+    def task_filter(self, raw_tasks: Dict):
+        """
+        过滤国内且余量大于0的任务进行下一步分发
+        :param raw_tasks:
+        :return:
+        """
+        result = []
+        data = raw_tasks.get("data", [])
+        for item in data:
+            task_site = item.get("taskSite")
+            biz_type = item.get("bizType")
+            valid_task_num = item.get("validTaskNum")
+            task_name = item.get("taskName")
+            day_task_num_limit = int(item.get("dayTaskNumLimit"))
+            claim_task_num = item.get("claimTaskNum")
+            if all([
+                claim_task_num < day_task_num_limit,
+                task_site == "XC",
+                biz_type == "HOTEL",
+                valid_task_num > 0,
+                "国内" in task_name,
+                # todo 暂时只跑详情
+                item["taskType"]=="XC_ROOM_DETAIL_RP_PIC_DISCOUNT",
+            ]):
+                try:
+                    result.append({
+                        "task_id":  item["id"],
+                        "task_name":  task_name,
+                        "task_type": item["taskType"],
+                        "valid_task_num": valid_task_num,
+                    })
+                except KeyError:
+                    logger.error("返回的任务列表格式有误，请检查！！！")
+        if not result:
+            logger.warning("当前账号无可领任务，请切换账号")
+        return result
+
+    def task_fetcher(self, original_task_info: dict) -> Dict:
+        """
+        根据可用的任务id实际领取任务
+        返回酒店一些必要的参数
+        :return:
+        """
+        city, hotel_name, check_in, check_out, claim_id = "", "", "", "", ""
+        room_info = []
+        if original_task_info.get("running_task") == 1:
+            api = "http://47.101.140.209/crowd/task/queryClaimTemplateTask"
+        else:
+            api = "http://47.101.140.209/crowd/task/claimTemplateTask"
+
+        params = {
+            "taskSetId": original_task_info["task_id"],
+            "token": self.token,
+        }
+        try:
+            response = requests.get(api, params)
+            if all([
+                response.status_code == 200,
+                response.json()["code"] == 200,
+                response.json()["msg"] == "正常返回"
+            ]):
+                data = response.json()["data"]
+                claim_id = data["claimId"]
+                task_info = data["taskInfo"]
+                for item in task_info:
+                    label = item["label"]
+                    if label == "所在城市":
+                        city = item["value"]
+                    elif label == "酒店名称":
+                        hotel_name = item["value"]
+                task_group = data["taskGroup"][0]
+                title = task_group["title"]
+                task_list = task_group["taskList"]
+                if  "离店时间" in title:
+                    check_in, check_out = self.extract_dates(title)
+                for item in task_list:
+                    room_id = item["key"]
+                    raw_room_name = item["title"]
+
+                    if raw_room_name == '列表页信息':
+                        room_name = raw_room_name
+                    else:
+                        try:
+                            room_pattern = r'房型：(.*?)\n'
+                            room_match = re.search(room_pattern, raw_room_name)
+                            room_name = room_match.group(1).strip()
+                        except:
+                            raise ValueError(f"提取房型名称报错， 错误字符串{raw_room_name}")
+
+
+                    room_info.append({
+                        "key": room_id,
+                        "title": room_name
+                    })
+            elif response and response.json()["msg"] == "当日无待领取任务":
+                return {}
+
+
+        except Exception as e:
+            logger.error(f"领取任务出现异常，报错原因{e}")
+        return {
+            "city": city,
+            "hotel_name": hotel_name,
+            "claim_id": claim_id,
+            "check_in": check_in,
+            "check_out": check_out,
+            "task_type": original_task_info["task_type"],
+            "room_info": room_info,
+        }
+
+    def add_task_to_redis(self,queue_name, task_info: Dict):
+        """保存 cookies 到 Redis 哈希表，field 为手机号"""
+        self.redis.sadd(queue_name, json.dumps(task_info))
+        logger.info(f"✅ 已将 任务 {task_info} 写入 Redis 队列，类型为 = {task_info['task_type']}")
+
+    def send_task(self, task_info: Dict):
+        # 根据任务类型确定队列
+        if task_info["task_type"] == "XC_ROOM_DETAIL_RP_PIC_DISCOUNT":
+            queue_name = "ctrip_detail_queue"
+            collection = "ctrip_detail_results"
+        elif task_info["task_type"] == "XC_LIST_TEMPLATE_PIC_DISCOUNT":
+            queue_name = "ctrip_list_queue"
+            collection = "ctrip_list_results"
+        else:
+            raise ValueError(f"未知任务类型 {task_info['task_type']}，请检查")
+
+        # 1. 推送前先去结果集合看有没有抓到
+        response = self.get_task_result(task_info, collection)
+        is_success, response = self.handle_task_result(response, task_info["task_type"])
+        if not is_success:
+            response = None
+
+        if not response:
+            # 推送任务
+            self.add_task_to_redis(queue_name, task_info)
+            logger.info(f"✅ 投放任务到 {queue_name}...")
+        else:
+            return response
+        # 获取任务结果， 2分钟抛出超时错误
+        start_time = time.time()
+        timeout = 300  # 2分钟超时
+
+        while True:
+            # 检查是否超时
+            if time.time() - start_time > timeout:
+                logger.warning("获取任务结果超时，已超过4分钟")
+                return {"msg": "任务响应超时"}
+
+            result = self.get_task_result(task_info, collection)
+            if result:
+                break
+            time.sleep(5)
+
+        # 检查响应是否正常
+        is_success, result = self.handle_task_result(result, task_info["task_type"])
+
+        return result
+
+
+    def screenshot(self, task_info: dict, response: dict = None):
+        """生成渲染数据并调用 Flask 接口渲染 + Playwright 截图"""
+
+        import os, requests
+        from playwright.sync_api import sync_playwright
+
+        hotel_name = task_info["hotel_name"]
+        check_in = task_info["check_in"]
+        check_out = task_info["check_out"]
+        date_dict = parse_checkin_checkout(check_in, check_out)
+
+        # 房型数据
+        rooms, dialogs = parse_room(json_content=response)
+        room_info_list = task_info.get("room_info", [])
+
+        # 初始化路径
+        today = datetime.datetime.now().strftime("%Y%m%d")
+        out_dir = f"screenshots/{today}/{hotel_name}"
+        os.makedirs(out_dir, exist_ok=True)
+
+        # 初始化 screenshots 字段
+        for room_item in room_info_list:
+            room_item["screenshots"] = []
+
+        flask_render_room_url = "http://127.0.0.1:5000/render_room"
+
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=False)
+            context = browser.new_context(**p.devices["iPhone X"])
+            page = context.new_page()
+
+            self.patch_page_rendering(page)
+
+            # === 处理房型列表页 ===
+            list_page_item = next((i for i in room_info_list if i["title"] == "列表页信息"), None)
+            if not list_page_item:
+                raise ValueError("房型列表页信息缺失")
+
+            # 遍历每个房型（非列表页）
+            for room_item in room_info_list:
+                title = room_item["title"].strip()
+
+                if title == "列表页信息":
+                    continue
+
+                logger.info(f"📸 开始处理房型：{title}")
+
+                # 匹配房型数据
+                target_rooms = [r for r in rooms if title == (r.get("name") or "")]
+                if not target_rooms:
+                    logger.warning(f"⚠ 未匹配到房型：{title}")
+                    continue
+
+                # 计算每种早餐的最低价 variant
+                breakfast_map = self.compute_breakfast_lowest_variant(target_rooms)
+
+                # 匹配对应弹窗
+                matched_dialogs = [
+                    d for d in dialogs
+                    if d.get("room_code") and any(v.get("code") == d.get("room_code") for v in breakfast_map.values())
+                ]
+
+                # 构建渲染 payload
+                payload = {
+                    "hotel_name": hotel_name,
+                    "checkin_date": date_dict["checkin_date"],
+                    "checkin_day": date_dict["checkin_day"],
+                    "checkout_date": date_dict["checkout_date"],
+                    "checkout_day": date_dict["checkout_day"],
+                    "stay_night": 1,
+                    "rooms": list(breakfast_map.values()),
+                    "dialog": matched_dialogs
+                }
+
+                # 调用 Flask
+                resp = requests.post(flask_render_room_url, json=payload)
+                if resp.status_code != 200:
+                    logger.error("❌ 渲染失败")
+                    continue
+
+                # 页面加载
+                page.set_content(resp.text, wait_until="networkidle")
+                page.wait_for_timeout(500)
+
+                # ✔ 截图列表页
+                list_img = self.capture_room_list_item(page, title, out_dir)
+                list_page_item["screenshots"].append(list_img)
+
+                # ✔ 截图每种早餐对应弹窗
+                for b_type, variant in breakfast_map.items():
+                    variant_code = variant.get("code")
+                    dialog_img = self.capture_dialog(page, variant_code, out_dir)
+                    if dialog_img:
+                        room_item["screenshots"].append(dialog_img)
+
+            browser.close()
+
+        return room_info_list
+
+    def patch_page_rendering(self, page):
+        page.evaluate("""
+            () => {
+                document.body.style.overflow = 'hidden';
+                document.body.style.webkitFontSmoothing = 'antialiased';
+                document.body.style.mozOsxFontSmoothing = 'grayscale';
+                document.body.style.textRendering = 'optimizeLegibility';
+            }
+        """)
+        page.add_style_tag(content="""
+            * {
+                image-rendering: crisp-edges !important;
+                text-rendering: optimizeLegibility !important;
+                -webkit-font-smoothing: antialiased !important;
+            }
+        """)
+
+    def capture_room_list_item(self, page, title, out_dir):
+        safe_title = title.replace("/", "_").replace(" ", "")
+        img_path = os.path.join(out_dir, f"{uuid.uuid4().hex}_list.png")
+        page.screenshot(path=img_path)
+        logger.info(f"✔ 列表页截图完成: {img_path}")
+        return img_path
+
+    def compute_breakfast_lowest_variant(self, rooms):
+        breakfast_types = ["无早餐", "1份早餐", "2份早餐"]
+
+        result = {}
+        for room in rooms:
+            bf_raw = room.get("breakfast", "") or ""
+
+            matched = next((b for b in breakfast_types if b in bf_raw), "无早餐")
+
+            price = float(room.get("price", 1e9) or 1e9)
+
+            if matched not in result or price < float(result[matched].get("price", 1e9)):
+                result[matched] = room
+
+        return result
+
+    def capture_dialog(self, page, variant_code, out_dir):
+        dialog_id = f"dialog-{variant_code}"
+        btn_selector = f'.open-discount-btn[data-dialog-id="{dialog_id}"]'
+        btn = page.query_selector(btn_selector)
+
+        if not btn:
+            logger.warning(f"⚠ 未找到弹窗按钮: {btn_selector}")
+            return None
+
+        try:
+            btn.scroll_into_view_if_needed()
+            page.wait_for_timeout(200)
+            btn.click()
+            page.wait_for_timeout(600)
+
+            img_path = os.path.join(out_dir, f"{uuid.uuid4().hex}_dialog.png")
+            page.screenshot(path=img_path)
+            logger.info(f"✔ 弹窗截图成功: {img_path}")
+
+            self.safe_close_dialog(page, variant_code)
+            return img_path
+
+        except Exception as e:
+            logger.error(f"❌ 弹窗截图失败: {e}")
+            return None
+
+    def safe_close_dialog(self, page, variant_code):
+        dialog_id = f"dialog-{variant_code}"
+        close_selector = f'.close[data-dialog-id="{dialog_id}"]'
+
+        try:
+            btn = page.query_selector(close_selector)
+            if btn:
+                btn.scroll_into_view_if_needed()
+                btn.click()
+            else:
+                mask = page.query_selector(f"#mask-{variant_code}")
+                if mask:
+                    mask.click()
+                else:
+                    page.mouse.click(10, 10)
+
+            page.wait_for_timeout(200)
+        except:
+            page.mouse.click(10, 10)
+
+
+    def get_task_result(self, task_info: Dict, collection: str, timeout: int = 120):
+        """
+        根据任务信息轮询 MongoDB 或 Redis 获取结果
+        """
+        response = {}
+        check_in = task_info.get("check_in")
+        check_out = task_info.get("check_out")
+        hotel_name = task_info.get("hotel_name")
+
+        today = datetime.datetime.now().strftime("%Y-%m-%d")
+        query = {"hotel_name": hotel_name, "check_in": check_in, "check_out": check_out, "date": today}
+
+        # 假设结果是存入 MongoDB 的（也可改为 Redis）
+
+        result = self.mongo.find_one(collection, query=query)
+        if result:
+            response = json.loads(result.get("response"))
+
+        return response
+
+    def stat_cookie(self, cookie: str, cookie_error: int):
+        """
+        统计 cookie 对应手机号的使用记录
+        仅在 cookie 不为空时执行
+        """
+        if not cookie:
+            return  # 未传 cookie，不记录
+
+        phone = None
+        try:
+            # redis 返回 str，不需要 decode
+            all_data = self.redis.hgetall("ctrip_ck_hash")
+
+            # key = phone, value = cookie
+            for k, v in all_data.items():
+                if v == cookie:
+                    phone = k
+                    break
+
+        except Exception as e:
+            logger.error(f"Redis 反查手机号失败: {e}")
+            return
+
+        if not phone:
+            logger.warning(f"⚠ 传入 cookie，但未从 redis ctrip_ck_hash 找到对应手机号: {cookie}")
+            return
+
+        # -------------------------
+        # 写入 / 更新 Mongo 记录
+        # -------------------------
+        record = self.mongo.find_one(self.cookie_col, {"phone": phone})
+
+        if record:
+            # 已存在记录 → 更新
+            if cookie_error == 0:  # success
+                new_success = record.get("success_count", 0) + 1
+                self.mongo.update(
+                    self.cookie_col,
+                    {"$set": {
+                        "cookie": cookie,
+                        "status": "success",
+                        "success_count": new_success
+                    }},
+                    {"phone": phone},
+
+                )
+            else:  # failed
+                self.mongo.update(
+                    self.cookie_col,
+                    {"$set": {
+                        "cookie": cookie,
+                        "status": "failed"
+                    }},
+                    {"phone": phone},
+
+                )
+
+        else:
+            # 不存在 → 新增
+            doc = {
+                "phone": phone,
+                "cookie": cookie,
+                "status": "success" if cookie_error == 0 else "failed",
+                "success_count": 1 if cookie_error == 0 else 0
+            }
+            self.mongo.insert_one(self.cookie_col, doc)
+
+
+    def handle_task_result(self, result: dict, task_type: str):
+        result_str = json.dumps(result)
+
+        if "priceInfo" in result_str:
+            if task_type == "XC_ROOM_DETAIL_RP_PIC_DISCOUNT":
+                if "totalPriceInfo" in result_str:
+                    logger.info("✅ cookie 正常，任务处理完成。")
+
+                    return True, result
+            else:
+                if "tipAfterPrice" in result_str or "酒店已售罄" in result_str:
+                    logger.info("✅ cookie 正常，任务处理完成。")
+                    return True, result
+
+        return False, {"msg": "数据结构异常"}
+
+    # ===== 第一步：请求 OSS 上传所需参数 =====
+    def get_oss_upload_info(self, token, file_name):
+        url = "http://47.101.140.209/crowd/task/getOssKey?token=" + token
+        headers = {
+            "Accept": "*/*",
+            "Content-Type": "application/json",
+            "Origin": "http://47.101.140.209",
+            "Referer": "http://47.101.140.209/crowd.html",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36",
+        }
+        cookies = {"crowd-code": "759528"}
+        payload = {
+            "bizType": "HOTEL",
+            "fileName": file_name,
+            "token": token
+        }
+        while True:
+            try:
+                resp = requests.post(url, headers=headers, json=payload, cookies=cookies, verify=False)
+                resp.raise_for_status()
+                if resp.json() and resp.json()["msg"] == '正常返回':
+                    data = resp.json()["data"]
+                    logger.info("✅ 获取 OSS 上传参数成功")
+                    return data
+            except Exception as e:
+                logger.warning(f"图片上传出现问题，错误原因{e}")
+                time.sleep(2)
+
+
+    # ===== 第二步：使用返回参数上传文件到 OSS =====
+    def upload_to_oss(self, file_path, oss_info):
+        url = f"https://{oss_info['url']}/"
+
+        data = {
+            "accessId": oss_info["accessId"],
+            "ossKey": oss_info["ossKey"],
+            "signature": oss_info["signature"],
+            "expiration": oss_info["expiration"],
+            "uuid": oss_info["uuid"],
+            "policy": oss_info["policy"],
+            "OSSAccessKeyId": oss_info["accessId"],
+            "key": oss_info["ossKey"]
+        }
+
+        files = {
+            "file": (file_path.split("/")[-1], open(file_path, "rb"), "image/png")
+        }
+
+        logger.info("📤 正在上传文件到 OSS ...")
+        while True:
+            try:
+                resp = requests.post(url, data=data, files=files)
+                resp.raise_for_status()
+                break
+            except Exception as e:
+                logger.warning("上传文件到 OSS，错误原因{e}, 继续重试")
+                time.sleep(2)
+
+        if resp.status_code == 204:
+            logger.info ("✅ 上传成功（OSS 无返回体）")
+        else:
+            logger.info("✅ 上传成功，响应：", resp.text)
+
+    def submit_template_task(self, task_info, token, submit_task_map, claim_id, do_submit=True):
+        """
+        提交模板任务
+
+        Args:
+            token (str): 认证token
+            submit_task_map (dict): 提交的任务映射，格式如：
+                {
+                    "1": ["path1.jpg", "path2.jpg"],
+                    "2": ["path3.jpg", "path4.jpg"],
+                    "3": ["path5.jpg", "path6.jpg"],
+                    "list_1_2_3": ["path7.jpg", "path8.jpg", "path9.jpg"]
+                }
+            claim_id (int): 任务声明ID
+            do_submit (bool): 是否实际提交，默认为False（测试用）
+
+        Returns:
+            dict: 服务器响应数据
+        """
+        url = "http://47.101.140.209/crowd/task/submitTemplateTask?token=" + token
+        headers = {
+          'Accept': '*/*',
+          'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6',
+          'Connection': 'keep-alive',
+          'Origin': 'http://47.101.140.209',
+          'Referer': 'http://47.101.140.209/crowd.html',
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36 Edg/142.0.0.0',
+          'content-type': 'application/json',
+          'Cookie': 'crowd-code=759528'
+        }
+
+        # 准备请求数据
+        payload = {
+            "claimId": claim_id,
+            "giveUpTaskMap": "{}",
+            "submitTaskMap": json.dumps(submit_task_map, ensure_ascii=False),
+            "doSubmit": do_submit,
+            "token": token
+        }
+
+        # 发送请求
+        resp = requests.post(
+            url,
+            headers=headers,
+            json=payload,
+            verify=False
+        )
+
+        resp.raise_for_status()
+        response_data = resp.json()
+
+        # logger.info(response_data)
+        if response_data and response_data.get("msg") == '未识别到匹配房型，请重试！':
+            result = "Failure"
+            self.mongo.write("task_log", {
+                "hotel_name": task_info["hotel_name"],
+                "check_in": task_info["check_in"],
+                "check_out": task_info["check_out"],
+                "status": result,
+                "response": json.dumps(response_data)
+            })
+            logger.warning("✅ 模板任务提交失败， 取消任务")
+            self.cancel_task(token, claim_id)
+            return response_data
+        elif response_data and "请确认是否继续提交任务" in response_data.get("msg"):
+            # 需要二次提交
+            return self.submit_template_task(task_info, self.token, submit_task_map, claim_id)
+        elif response_data and response_data.get("msg") == "正常返回":
+            result = "Success"
+            self.mongo.write("task_log", {
+                "hotel_name": task_info["hotel_name"],
+                "check_in": task_info["check_in"],
+                "check_out": task_info["check_out"],
+                "status": result,
+                "response": json.dumps(response_data)
+            })
+            logger.info(f"》》》》》step6. {task_info['hotel_name']} 任务提交成功\n\n")
+            return response_data
+        elif  response_data and any(
+                [
+                    response_data.get("msg") == '任务集已失效，请刷新后重试',
+                    response_data.get("msg") == '找不到该任务认领记录',
+
+                ]):
+            logger.info("任务集已失效，请刷新后重试！")
+            self.cancel_task(token, claim_id)
+            return response_data
+        else:
+            logger.warning(response_data)
+            raise RequestError("提交任务存在异常，请检查")
+
+
+
+    def cancel_task(self, token, claim_id, reason_type="搜索不到酒店"):
+        """
+        取消任务
+
+        Args:
+            token (str): 认证token
+            claim_id (int): 任务声明ID
+            reason_type (str): 取消原因类型，默认为"搜索不到酒店"
+
+        Returns:
+            dict: 服务器响应数据
+        """
+        # URL编码取消原因
+        encoded_reason = quote(reason_type, encoding='utf-8')
+
+        url = f"http://47.101.140.209/crowd/task/cancelTask?claimId={claim_id}&reasonType={encoded_reason}&token={token}"
+
+        headers = {
+          'Accept': '*/*',
+          'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6',
+          'Connection': 'keep-alive',
+          'Referer': 'http://47.101.140.209/crowd.html',
+          'User-Agent': 'Mozilla/5.0 (Linux; Android 8.0.0; SM-G955U Build/R16NW) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Mobile Safari/537.36 Edg/142.0.0.0',
+          'Cookie': 'crowd-code=759528'
+        }
+
+        # 发送GET请求
+        resp = requests.get(
+            url,
+            headers=headers,
+            verify=False
+        )
+
+        resp.raise_for_status()
+        response_data = resp.json()
+
+        if response_data and response_data.get("msg") == '正常返回':
+            logger.info("✅ 任务取消成功")
+            return response_data
+        else:
+            error_msg = response_data.get("msg", "未知错误")
+            raise Exception(f"任务取消失败: {error_msg}")
+
+    def run(self):
+        """单账号运行逻辑"""
+        with self.lock:  # 确保单个账号串行执行
+            # 1.登录任务平台
+            self.login()
+
+            while True:
+                # 2. 先尝试从运行中任务中看有没有进行中任务
+                tasks = self.get_running_task()
+                # 3. 获取任务列表
+                if not tasks:
+                    tasks = self.get_tasks()
+
+                if not tasks:
+                    logger.info(f"[{self.username}] 当前无可用任务，程序休眠2s")
+                    time.sleep(2)
+                    continue
+
+                # 4.每个任务列表遍历去接取
+                task_info = {}
+                for task in tasks:
+                    task_info = self.task_fetcher(task)
+                    # 一次只能接一个任务，
+                    if task_info:
+                        break
+
+                if not task_info:
+                    logger.info(f"[{self.username}] 当前无可用任务，程序休眠2s")
+                    time.sleep(2)
+                    continue
+
+                claim_id = task_info["claim_id"]
+                hotel_name = task_info["hotel_name"]
+                if not hotel_name:
+                    continue
+                logger.info(f"[{self.username}] 》》》》》step2. 酒店：{task_info['hotel_name']}开始运行\n\n")
+
+                # 5. 根据接取到的任务执行请求操作
+                retry_count = 0
+                while True:
+                    response = self.send_task(task_info)
+
+                    if (response and (response.get('code') == 305 or response.get("data"))) or retry_count >= MAX_RETRIES:
+                        break
+                    else:
+                        retry_count += 1
+                        logger.info(f"[{self.username}] 》》》》》 酒店：{task_info['hotel_name']}重试第{retry_count}次\n\n")
+                        time.sleep(30)
+
+
+
+                if retry_count >= MAX_RETRIES and (not(response and response.get("data")) or response.get('code') == 305) :
+                    self.cancel_task(self.token, claim_id)
+                    logger.warning(f" 酒店：{task_info['hotel_name']}重试次数过多，提前取消")
+                else:
+                    logger.info(f"[{self.username}] 》》》》》step3. {task_info['hotel_name']} 数据请求成功\n\n")
+                    # 6. 生成各房型对应图片
+                    room_info = self.screenshot(task_info, response)
+
+                    logger.info(f"[{self.username}] 》》》》》step4. {task_info['hotel_name']} 截图成功\n\n")
+
+                    # 7.图片上传
+                    submit_map = {}
+                    for item in room_info:
+                        key = item["key"]
+                        image_paths = item["screenshots"]
+
+                        submit_map[key] = []
+
+                        for img_path in image_paths:
+                            file_name = os.path.basename(img_path)
+
+                            # 步骤1：获取 OSS 上传参数
+                            oss_info = self.get_oss_upload_info(self.token, file_name)
+                            oss_key = oss_info["ossKey"]
+
+                            # 步骤2：上传到 OSS
+                            self.upload_to_oss(img_path, oss_info)
+                            submit_map[key].append(oss_key)
+
+                            time.sleep(0.5)  # 防止接口过快
+                    logger.info(f"[{self.username}] 》》》》》step5. {task_info['hotel_name']} 图片上传成功\n\n")
+                    # 8.提交任务
+                    self.submit_template_task(task_info, self.token, submit_map, claim_id)
+                    logger.info(f"[{self.username}] " + "*" * 50)
+            # 9.根据任务提交结果进行记录
+
+
+class MultiAccountScheduler:
+    """
+    多账号并发调度器
+    """
+
+    def __init__(self, accounts: List[Dict[str, str]]):
+        """
+        Args:
+            accounts: 账号列表，格式 [{"username": "user1", "password": "pwd1"}, ...]
+        """
+        self.accounts = accounts
+        self.schedulers = []
+        self._init_schedulers()
+
+    def _init_schedulers(self):
+        """初始化每个账号的调度器"""
+        for account in self.accounts:
+            scheduler = SchedulerAuto(
+                username=account["username"],
+                password=account["password"]
+            )
+            self.schedulers.append(scheduler)
+
+    def run_sequential(self):
+        """顺序执行（用于调试）"""
+        for i, scheduler in enumerate(self.schedulers):
+            logger.info(f"开始执行第 {i + 1} 个账号: {scheduler.username}")
+            try:
+                scheduler.run()
+            except Exception as e:
+                logger.error(f"账号 {scheduler.username} 执行失败: {e}")
+
+    def run_concurrent(self, max_workers: int = None):
+        """
+        并发执行多账号
+
+        Args:
+            max_workers: 最大并发数，默认使用账号数量
+        """
+        if max_workers is None:
+            max_workers = len(self.schedulers)
+
+        logger.info(f"开始并发执行 {len(self.schedulers)} 个账号，最大并发数: {max_workers}")
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # 提交所有任务
+            future_to_scheduler = {
+                executor.submit(self._run_scheduler_wrapper, scheduler): scheduler
+                for scheduler in self.schedulers
+            }
+
+            # 等待所有任务完成
+            for future in concurrent.futures.as_completed(future_to_scheduler):
+                scheduler = future_to_scheduler[future]
+                try:
+                    future.result()
+                    logger.info(f"账号 {scheduler.username} 执行完成")
+                except Exception as e:
+                    logger.error(f"账号 {scheduler.username} 执行失败: {e}")
+
+    def _run_scheduler_wrapper(self, scheduler):
+        """包装执行函数，添加异常处理"""
+        scheduler.run()
+
+    def run_continuous(self, max_workers: int = None):
+        """
+        持续并发运行（推荐使用）
+        每个账号在自己的线程中持续运行
+        """
+        if max_workers is None:
+            max_workers = len(self.schedulers)
+
+        logger.info(f"启动持续并发执行，账号数: {len(self.schedulers)}，并发数: {max_workers}")
+
+        # 使用线程池管理所有账号的持续运行
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # 为每个调度器提交持续运行任务
+            futures = [
+                executor.submit(self._run_continuous_wrapper, scheduler)
+                for scheduler in self.schedulers
+            ]
+
+            # 等待所有任务（实际上会持续运行直到手动停止）
+            try:
+                for future in concurrent.futures.as_completed(futures):
+                    try:
+                        future.result()
+                    except Exception as e:
+                        logger.error(f"账号执行异常: {e}")
+            except KeyboardInterrupt:
+                logger.info("收到中断信号，停止所有任务")
+                for future in futures:
+                    future.cancel()
+
+    def _run_continuous_wrapper(self, scheduler):
+        """持续运行包装器，包含重启逻辑"""
+        while True:
+            try:
+                logger.info(f"启动账号 {scheduler.username} 的任务执行")
+                scheduler.run()
+            except Exception as e:
+                logger.error(f"账号 {scheduler.username} 执行异常，10秒后重启: {e}")
+                time.sleep(10)
+if __name__ == '__main__':
+    # # 1️⃣ 你的 token（示例中从 curl 提取）
+    # token = "MzIxYjAzM2M3YWE1YjkxOGJmZGE5NGNhYjIzOTUwODNfMjUxMTA4MTYxOTAw"
+    #
+    # # 2️⃣ 上传的文件名 / 路径
+    # file_path = "a893a8c5434834db92af23a6060cbcc4.png"
+    #
+    # # 3️⃣ 获取 OSS 上传参数
+    # oss_info = get_oss_upload_info(token, file_path.split("/")[-1])
+    #
+    # # 4️⃣ 上传文件
+    # upload_to_oss(file_path, oss_info)
+    # file_path = r"C:\Users\95826\Documents\携程项目\json\test.json"
+    #
+    # with open(file_path, "r", encoding="utf-8") as f:
+    #     json_content = json.load(f)
+
+
+    # platform = Scheduler("sx001", "759528")
+
+    accounts = [
+        {"username": "sx001", "password": "759528"},
+        # {"username": "sx002", "password": "605236"},
+        # {"username": "sx003", "password": "575993"},
+        # {"username": "sx004", "password": "538615"},
+        #
+        # {"username": "sx005", "password": "964202"},
+        # {"username": "sx006", "password": "855541"},
+        # {"username": "sx007", "password": "967291"},
+        # {"username": "sx008", "password": "902115"},
+        # 可以添加更多账号...
+    ]
+
+    # 创建多账号调度器
+    multi_scheduler = MultiAccountScheduler(accounts)
+
+    # 方式1: 并发执行（推荐）
+    multi_scheduler.run_concurrent()
+
+    # logger.info(platform.screenshot({"city": "上海",
+    #         "hotel_name": "三亚亚龙湾瑞士酒店",
+    #         "check_in": "2025-11-15",
+    #         "check_out": "2025-11-16",
+    #         "task_type": "detail",
+    #         "room_info": [
+    #             {
+    #                 "key": "list",
+    #                 "title": "列表页"
+    #             },
+    #             {
+    #                 "key": "1",
+    #                 "title": "瑞士精选泳池景观双床房"
+    #             },
+    #             {
+    #                 "key": "2",
+    #                 "title": "瑞士豪华双床房（开放式阳台）"
+    #             },
+    #             {
+    #
+    #                 "key": "3",
+    #                 "title": "瑞士精选大床房（开放式阳台）"
+    #             },
+    #             {
+    #                 "key": "4",
+    #                 "title": "瑞士豪华大床房（开放式阳台）"
+    #             },
+    #             {
+    #                 "key": "5",
+    #                 "title": "瑞士特色泳池双床房"
+    #             }
+    #         ]
+    #
+    #         }, json_content))
+
+    # logger.info(platform.run())
+
+
+    # ==== 使用示例 ====
+    # cm = CookieManager()
+    #
+    # # 初始化：假设一开始全在 ready 池
+    # # cm.redis.sadd(cm.cookie_ready, "cookie_A", "cookie_B", "cookie_C")
+    #
+    # cookie = cm.get_valid_cookie()
+    # cm.mark_cookie_used(cookie)
