@@ -105,16 +105,104 @@ class CrawlerByAuto:
 
     def save_to_mongo(self, collection_name: str, data: dict):
         """
-        同步方式写入 MongoDB
+        同步方式写入 MongoDB - 先查询现有数据，只有不正常时才更新插入
         """
-
         now = datetime.now()
-        data["date"] = now.strftime("%Y-%m-%d")  # 当天日期
-        data["created_at"] = now.strftime("%Y-%m-%d %H:%M:%S")  # 完整时间字符串
+        data["date"] = now.strftime("%Y-%m-%d")
+        data["created_at"] = now.strftime("%Y-%m-%d %H:%M:%S")
 
-        self.mongo.update(collection_name, data,
-                          query={"date": data["date"], "hotel_name": data["hotel_name"], "check_in": data["check_in"],
-                                 "check_out": data["check_out"]}, upsert=True)
+        # 构建查询条件
+        query = {
+            "date": data["date"],
+            "hotel_name": data["hotel_name"],
+            "check_in": data["check_in"],
+            "check_out": data["check_out"]
+        }
+
+        # 新增：验证响应数据
+        response_str = data.get("response", "{}")
+        try:
+            response_data = json.loads(response_str)
+            data["is_valid"] = self.is_valid_response_data(response_data, data.get("task_type"))
+        except:
+            data["is_valid"] = False
+
+        # 查询 MongoDB 中是否已存在该记录
+        existing_data = self.mongo.find_one(collection_name, query)
+
+        if existing_data:
+            # 如果已存在记录，检查现有数据是否正常
+            existing_response_str = existing_data.get("response", "{}")
+            try:
+                existing_response_data = json.loads(existing_response_str)
+                existing_is_valid = self.is_valid_response_data(existing_response_data, existing_data.get("task_type"))
+            except:
+                existing_is_valid = False
+
+            # 只有当现有数据不正常且新数据正常时，才更新
+            if not existing_is_valid and data["is_valid"]:
+                logger.info(f"更新无效数据为有效数据: {data['hotel_name']} - {data['check_in']}")
+                self.mongo.update(collection_name, data, query=query, upsert=True)
+            elif not existing_is_valid and not data["is_valid"]:
+                # 如果新旧数据都不正常，可以选择更新（记录最新错误）或不更新
+                # 这里选择更新，以记录最新的错误信息
+                logger.info(f"更新无效数据（记录最新错误）: {data['hotel_name']} - {data['check_in']}")
+                self.mongo.update(collection_name, data, query=query, upsert=True)
+            else:
+                logger.info(f"数据已存在且正常，跳过保存: {data['hotel_name']} - {data['check_in']}")
+        else:
+            # 如果不存在记录，直接插入
+            logger.info(f"插入新数据: {data['hotel_name']} - {data['check_in']}")
+            self.mongo.update(collection_name, data, query=query, upsert=True)
+
+    def is_valid_response_data(self, response_data: dict, task_type: str) -> bool:
+        """判断响应数据是否有效"""
+        if not response_data:
+            return False
+
+        # 检查服务器错误码
+        if response_data.get("code") in [301, 303, 304, 305, 306, 307]:
+            return False
+
+        # 检查是否有实际数据
+        if "data" not in response_data:
+            return False
+
+        # 根据任务类型进行更详细的验证
+        if task_type == "detail":
+            return self._is_valid_detail_response(response_data)
+        elif task_type == "list":
+            return self._is_valid_list_response(response_data)
+
+        return True
+
+    def _is_valid_detail_response(self, response_data: dict) -> bool:
+        """验证详情页响应数据的有效性"""
+        data = response_data.get("data", {})
+        if not data:
+            return False
+
+        # 检查是否包含价格信息
+        sale_room_map = data.get("saleRoomMap", {})
+        if not sale_room_map:
+            return False
+
+        # 检查第一个房型是否有价格信息
+        first_room = list(sale_room_map.values())[0]
+        price_info = first_room.get("priceInfo", {})
+        display_price = price_info.get("displayPrice", "")
+
+        return bool(display_price and display_price.startswith("¥"))
+
+    def _is_valid_list_response(self, response_data: dict) -> bool:
+        """验证列表页响应数据的有效性"""
+        data = response_data.get("data", {})
+        if not data:
+            return False
+
+        # 检查是否包含酒店列表
+        hotel_list = data.get("hotelList", [])
+        return len(hotel_list) > 0
 
     async def list_spider(self, task: dict):
         """
@@ -368,13 +456,14 @@ class CrawlerByAuto:
 
     async def detail_spider(self, task: dict):
         """
-        使用 aiohttp 的异步详情爬虫
+        使用 aiohttp 的异步详情爬虫 - 支持305错误特殊处理
         """
         task_id = self._get_task_identifier(task, "detail")
 
         try:
             hotel_info = await self.hotel_info_spider(task)
             if not hotel_info:
+                logger.warning(f"无法获取酒店信息: {task.get('hotel_name')}")
                 save_data = {
                     "city": task.get("city"),
                     "hotel_name": task.get("hotel_name"),
@@ -383,26 +472,32 @@ class CrawlerByAuto:
                     "task_type": "detail",
                     "status_code": 404,
                     "response": json.dumps({"msg": "搜索不到酒店"}),
+                    "success": False,
+                    "need_cancel": False  # 不需要取消任务
                 }
-            else:
-                hotel_info["fetch_detail"] = "true"
-                base_url = "http://127.0.0.1:8004/xc/getHotelRoomListInland"
-                query_string = urlencode(hotel_info)
-                url = f"{base_url}?{query_string}"
+                self.save_to_mongo("ctrip_detail_results", save_data)
+                return {"status": "failed", "need_cancel": False}
 
-                headers = {
-                    'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6',
-                    'Referer': 'http://127.0.0.1:8004/docs',
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36 Edg/142.0.0.0',
-                    'accept': 'application/json',
-                }
+            hotel_info["fetch_detail"] = "true"
+            base_url = "http://127.0.0.1:8004/xc/getHotelRoomListInland"
+            query_string = urlencode(hotel_info)
+            url = f"{base_url}?{query_string}"
 
-                session = await self.get_session()
-                try:
-                    async with session.get(url, headers=headers) as response:
-                        response_data = await response.json()
-                        logger.info("详情页价格数据爬取完成:", response_data)
+            headers = {
+                'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6',
+                'Referer': 'http://127.0.0.1:8004/docs',
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36 Edg/142.0.0.0',
+                'accept': 'application/json',
+            }
 
+            session = await self.get_session()
+            try:
+                async with session.get(url, headers=headers) as response:
+                    response_data = await response.json()
+
+                    # 检查是否是305错误
+                    if self.is_305_error(response_data):
+                        logger.warning(f"检测到305错误，需要取消任务: {response_data}")
                         save_data = {
                             "city": task.get("city"),
                             "hotel_name": task.get("hotel_name"),
@@ -411,25 +506,51 @@ class CrawlerByAuto:
                             "task_type": "detail",
                             "status_code": response.status,
                             "response": json.dumps(response_data),
+                            "success": False,
+                            "need_cancel": True,  # 标记需要取消任务
+                            "server_code": 305
                         }
-                except Exception as e:
-                    logger.error(f"详情页请求失败: {e}")
+                        self.save_to_mongo("ctrip_detail_results", save_data)
+                        return {"status": "failed", "need_cancel": True, "code": 305}
+
+                    # 正常处理其他情况
+                    is_success = self.is_successful_response(response_data)
+                    logger.info(f"详情页数据爬取完成: 成功={is_success}")
+
                     save_data = {
                         "city": task.get("city"),
                         "hotel_name": task.get("hotel_name"),
                         "check_in": task.get("check_in"),
                         "check_out": task.get("check_out"),
                         "task_type": "detail",
-                        "status_code": 500,
-                        "response": json.dumps({"error": str(e)}),
+                        "status_code": response.status,
+                        "response": json.dumps(response_data),
+                        "success": is_success,
+                        "need_cancel": False,  # 其他情况不需要取消
+                        "server_code": response_data.get("code") if isinstance(response_data, dict) else None
                     }
 
-            self.save_to_mongo("ctrip_detail_results", save_data)
-            return True
+                    self.save_to_mongo("ctrip_detail_results", save_data)
+                    return {"status": "success" if is_success else "failed", "need_cancel": False}
+
+            except Exception as e:
+                logger.error(f"详情页请求失败: {e}")
+                save_data = {
+                    "city": task.get("city"),
+                    "hotel_name": task.get("hotel_name"),
+                    "check_in": task.get("check_in"),
+                    "check_out": task.get("check_out"),
+                    "task_type": "detail",
+                    "status_code": 500,
+                    "response": json.dumps({"error": str(e)}),
+                    "success": False,
+                    "need_cancel": False
+                }
+                self.save_to_mongo("ctrip_detail_results", save_data)
+                return {"status": "failed", "need_cancel": False}
 
         except Exception as e:
             logger.error(f"详情页爬取失败: {e}")
-            # 记录失败状态到 MongoDB
             save_data = {
                 "city": task.get("city"),
                 "hotel_name": task.get("hotel_name"),
@@ -438,15 +559,52 @@ class CrawlerByAuto:
                 "task_type": "detail",
                 "status_code": 500,
                 "response": json.dumps({"error": str(e)}),
+                "success": False,
+                "need_cancel": False
             }
             self.save_to_mongo("ctrip_detail_results", save_data)
-            return False
-
+            return {"status": "failed", "need_cancel": False}
         finally:
-            # 无论成功还是失败，都从缓冲队列中移除
             if task_id in self.processing_detail_tasks:
                 self.processing_detail_tasks.remove(task_id)
                 logger.info(f"详情任务 {task_id} 已从缓冲队列移除")
+
+    def is_305_error(self, response_data: dict) -> bool:
+        """检查是否是305错误（需要取消任务的错误）"""
+        if not response_data or not isinstance(response_data, dict):
+            return False
+        return response_data.get("code") == 305
+
+    def is_successful_response(self, response_data: dict) -> bool:
+        """
+        根据服务器响应判断是否成功
+        服务器成功响应：包含完整的data结构，没有code字段或code为200
+        服务器失败响应：{"code": 301/303/304/305/306/307, "data": {}, "msg": "错误信息"}
+        """
+        if not response_data:
+            return False
+
+        # 如果包含错误码，说明是失败响应
+        if "code" in response_data:
+            error_code = response_data.get("code")
+            # 只有没有code字段或者code为200才是成功响应
+            return error_code == 200
+
+        # 检查是否包含成功的数据结构
+        if "data" in response_data:
+            data = response_data["data"]
+            # 对于详情任务，检查是否包含价格信息
+            if data and "saleRoomMap" in data:
+                sale_room_map = data.get("saleRoomMap", {})
+                if sale_room_map:
+                    # 检查第一个房型是否有价格信息
+                    first_room = list(sale_room_map.values())[0]
+                    price_info = first_room.get("priceInfo", {})
+                    display_price = price_info.get("displayPrice", "")
+                    if display_price and display_price.startswith("¥"):
+                        return True
+
+        return False
 
     async def close(self):
         """关闭 session"""
@@ -517,7 +675,7 @@ class CrawlerByAuto:
                     await asyncio.sleep(5)  # 等待一段时间再检查
 
             # 检查详情任务队列
-            detail_task = self.redis.spop('ctrip_detail_queue')
+            detail_task = self.redis.spop('ctrip_detail_queue_v3')
             if detail_task:
                 task = json.loads(detail_task)
                 task_id = self._get_task_identifier(task, "detail")
